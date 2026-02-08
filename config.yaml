@@ -70,7 +70,7 @@ repos:
 
   # Everything else
   - github: "scylladb/alternator-load-balancing"
-    jira_prefix: "Alternator:"
+    jira_prefix: "[Alternator Clients]:"
     scylla_components: "Alternator Clients"
   - github: "scylladb/scylla-cdc-source-connector"
     jira_prefix: "cdc-source-connector:"
@@ -82,6 +82,6 @@ repos:
     jira_prefix: "spark-scylladb-connector:"
     scylla_components: "Connector - spark-connector"
   - github: "scylladb/scylla-drivers"
-    jira_prefix: "Drivers:"
+    jira_prefix: "[Scylla Drivers]:"
     scylla_components: "Drivers"
 
