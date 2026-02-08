@@ -17,7 +17,7 @@ import sys
 import requests
 import yaml
 
-from common import JiraManager, load_config
+from common import JiraManager, compute_body_hash, extract_hash_from_adf, load_config
 
 GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
 
@@ -175,6 +175,168 @@ def detect_jira_link(body):
     return None
 
 
+def _convert_inline_markup(text):
+    """Convert inline Markdown markup to Jira wiki markup within a single line."""
+    # Images: ![alt](url) -> !url!
+    text = re.sub(r'!\[([^\]]*)\]\(([^)]+)\)', r'!\2!', text)
+    # Links: [text](url) -> [text|url]
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'[\1|\2]', text)
+    # Bold: **text** -> *text*
+    text = re.sub(r'\*\*(.+?)\*\*', r'*\1*', text)
+    # Strikethrough: ~~text~~ -> -text-
+    text = re.sub(r'~~(.+?)~~', r'-\1-', text)
+    # Italic: *text* -> _text_  (but not inside already-converted bold markers)
+    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'_\1_', text)
+    # Inline code: `code` -> {{code}}
+    text = re.sub(r'`([^`]+)`', r'{{\1}}', text)
+    return text
+
+
+def markdown_to_jira_wiki(text):
+    """Line-by-line Markdown to Jira wiki markup conversion."""
+    if not text:
+        return ""
+
+    lines = text.split("\n")
+    result = []
+    in_code_block = False
+    code_lang = ""
+
+    for line in lines:
+        # Code blocks
+        if line.strip().startswith("```"):
+            if not in_code_block:
+                in_code_block = True
+                code_lang = line.strip()[3:].strip()
+                if code_lang:
+                    result.append(f"{{code:{code_lang}}}")
+                else:
+                    result.append("{code}")
+                continue
+            else:
+                in_code_block = False
+                result.append("{code}")
+                continue
+
+        if in_code_block:
+            result.append(line)
+            continue
+
+        # Headers: # H -> h1. H
+        header_match = re.match(r'^(#{1,6})\s+(.*)', line)
+        if header_match:
+            level = len(header_match.group(1))
+            content = _convert_inline_markup(header_match.group(2))
+            result.append(f"h{level}. {content}")
+            continue
+
+        # Task lists: - [ ] -> * (x), - [x] -> * (/)
+        task_match = re.match(r'^(\s*)[-*]\s+\[( )\]\s*(.*)', line)
+        if task_match:
+            indent = len(task_match.group(1)) // 2
+            content = _convert_inline_markup(task_match.group(3))
+            result.append("*" * (indent + 1) + f" (x) {content}")
+            continue
+        task_match = re.match(r'^(\s*)[-*]\s+\[[xX]\]\s*(.*)', line)
+        if task_match:
+            indent = len(task_match.group(1)) // 2
+            content = _convert_inline_markup(task_match.group(2))
+            result.append("*" * (indent + 1) + f" (/) {content}")
+            continue
+
+        # Unordered lists: - item -> * item
+        list_match = re.match(r'^(\s*)[-*]\s+(.*)', line)
+        if list_match:
+            indent = len(list_match.group(1)) // 2
+            content = _convert_inline_markup(list_match.group(2))
+            result.append("*" * (indent + 1) + f" {content}")
+            continue
+
+        # Ordered lists: 1. item -> # item
+        ol_match = re.match(r'^(\s*)\d+\.\s+(.*)', line)
+        if ol_match:
+            indent = len(ol_match.group(1)) // 2
+            content = _convert_inline_markup(ol_match.group(2))
+            result.append("#" * (indent + 1) + f" {content}")
+            continue
+
+        # Horizontal rule
+        if re.match(r'^---+\s*$', line):
+            result.append("----")
+            continue
+
+        # Regular line with inline markup
+        result.append(_convert_inline_markup(line))
+
+    return "\n".join(result)
+
+
+def build_jira_description(github_body, github_url):
+    """Compose full Jira description with converted body, link, and hash footer."""
+    body_hash = compute_body_hash(github_body)
+    converted = markdown_to_jira_wiki(github_body or "")
+
+    parts = [converted] if converted else []
+    parts.append("")
+    parts.append("----")
+    parts.append(f"Migrated from GitHub issue: [{github_url}]")
+    parts.append(f"Hash: {body_hash}")
+
+    return "\n".join(parts)
+
+
+def _check_update_needed(github_body, jira_key, mgr):
+    """Check if a Jira issue description needs updating.
+
+    Fetches the Jira issue, extracts the stored hash from ADF description,
+    and compares with the current GitHub body hash.
+
+    Returns (action, reason) tuple.
+    """
+    try:
+        issue = mgr.get_issue(jira_key)
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            print(f"  Warning: Jira issue {jira_key} not found (404), skipping",
+                  file=sys.stderr)
+            return ("skip", f"Jira issue {jira_key} not found")
+        raise
+
+    description = issue.get("fields", {}).get("description")
+    stored_hash = extract_hash_from_adf(description)
+
+    if stored_hash is None:
+        return ("skip", "Already migrated (no hash)")
+
+    current_hash = compute_body_hash(github_body)
+    if stored_hash == current_hash:
+        return ("skip", "Already migrated (hash matches)")
+
+    return ("update", "Description changed (hash mismatch)")
+
+
+def _update_jira_issue(entry, jira, config):
+    """Update a Jira issue description via atlassian.Jira (v2 API, wiki markup)."""
+    jira_key = entry["jira_key"]
+    github_ref = entry["github_ref"]
+    github_body = entry.get("github_body", "")
+
+    description = build_jira_description(github_body, github_ref)
+
+    print(f"  Updating {jira_key}: {entry.get('github_title', '')}", file=sys.stderr)
+    jira.update_issue_field(jira_key, {"description": description})
+    print(f"    Updated description for {jira_key}", file=sys.stderr)
+
+
+def _plan_for_display(plan):
+    """Strip github_body from plan entries for YAML output readability."""
+    display_plan = []
+    for entry in plan:
+        cleaned = {k: v for k, v in entry.items() if k != "github_body"}
+        display_plan.append(cleaned)
+    return display_plan
+
+
 def scan_repo(repo_config, token):
     """Scan a single repo: fetch epics and their sub-issues, detect Jira links."""
     parts = repo_config["github"].split("/")
@@ -222,10 +384,13 @@ def find_missing_components(repos, mgr):
 
     Returns a list of missing value strings.
     """
-    # Collect unique component values from config
+    # Collect unique component values from config (including rules)
     needed = set()
     for repo in repos:
         needed.add(repo["scylla_components"])
+        for rule in repo.get("rules", []):
+            if "scylla_components" in rule:
+                needed.add(rule["scylla_components"])
 
     # Fetch existing options from Jira
     field = mgr.find_field("Scylla Components")
@@ -254,38 +419,103 @@ def find_missing_components(repos, mgr):
     return missing
 
 
-def build_plan(scan_results, repo_config, config, missing_components):
+def resolve_rule(title, repo_config, global_config):
+    """Resolve jira_prefix, scylla_components, and github_title_strip for an issue title.
+
+    Checks repo rules in order; the first rule whose match.issue_title regex
+    matches the title wins. Returns (prefix, components, strip_patterns, cleaned_title)
+    where cleaned_title has the matched pattern stripped from the front.
+    Falls back to the repo defaults if no rule matches.
+
+    github_title_strip resolution: rule > repo > global > default.
+    """
+    default_patterns = _as_list(global_config.get("github_title_strip", [r'^\[.*?\]\s*']))
+    repo_patterns = _as_list(repo_config.get("github_title_strip", default_patterns))
+
+    for rule in repo_config.get("rules", []):
+        m = re.match(rule["match"]["issue_title"], title)
+        if m:
+            prefix = rule.get("jira_prefix", repo_config["jira_prefix"])
+            components = rule.get("scylla_components", repo_config["scylla_components"])
+            patterns = _as_list(rule.get("github_title_strip", repo_patterns))
+            cleaned = title[m.end():].lstrip()
+            return prefix, components, patterns, cleaned
+    return repo_config["jira_prefix"], repo_config["scylla_components"], repo_patterns, title
+
+
+def _as_list(value):
+    """Ensure value is a list; wrap a bare string."""
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def strip_title(title, patterns):
+    """Apply a list of regex substitutions to strip noise from a title."""
+    for pattern in _as_list(patterns):
+        title = re.sub(pattern, '', title).strip()
+    return title
+
+
+def repo_config_for_url(github_url, title, config):
+    """Find the repo config matching a GitHub issue URL.
+
+    Parses owner/repo from the URL and looks it up in config["repos"].
+    Returns None if no match is found.
+    """
+    m = re.match(r"https://github\.com/([^/]+/[^/]+)/", github_url)
+    if m:
+        repo_slug = m.group(1)
+        for repo in config["repos"]:
+            if repo["github"] == repo_slug:
+                return repo
+        print(f"  Warning: no config for {repo_slug}, skipping"
+              f" ({github_url} \"{title}\")",
+              file=sys.stderr)
+    return None
+
+
+def build_plan(scan_results, repo_config, config, missing_components, mgr=None, skip_update_check=False):
     """Generate a migration plan from scan results."""
     plan = []
-    prefix = repo_config["jira_prefix"]
     project = config["jira_project"]
-    components = repo_config["scylla_components"]
     type_mapping = config.get("type_mapping", {})
     default_worktype = config.get("default_worktype", "Task")
-    component_missing = components in missing_components
 
     for entry in scan_results:
         epic = entry["epic"]
         epic_jira_key = entry["jira_key"]
 
         if epic_jira_key:
-            plan.append({
-                "action": "skip",
-                "github_ref": epic["url"],
-                "github_title": epic["title"],
-                "jira_key": epic_jira_key,
-                "reason": "Already migrated",
-            })
-        else:
-            action = "create"
-            entry_plan = {
+            if mgr and not skip_update_check:
+                action, reason = _check_update_needed(epic.get("body", ""), epic_jira_key, mgr)
+            else:
+                action, reason = "skip", "Already migrated"
+            plan_entry = {
                 "action": action,
                 "github_ref": epic["url"],
                 "github_title": epic["title"],
+                "jira_key": epic_jira_key,
+                "reason": reason,
+            }
+            if action == "update":
+                plan_entry["github_body"] = epic.get("body", "")
+            plan.append(plan_entry)
+        else:
+            effective_config = repo_config_for_url(epic["url"], epic["title"], config)
+            if not effective_config:
+                continue
+            prefix, components, patterns, cleaned = resolve_rule(epic["title"], effective_config, config)
+            component_missing = components in missing_components
+            entry_plan = {
+                "action": "create",
+                "github_ref": epic["url"],
+                "github_title": epic["title"],
+                "github_body": epic.get("body", ""),
                 "jira_issue_type": "Epic",
                 "jira_project": project,
                 "scylla_components": components,
-                "summary": "{} {}".format(prefix, re.sub(r'^\[.*?\]\s*', '', epic['title'])),
+                "summary": "{} {}".format(prefix, strip_title(cleaned, patterns)),
             }
             if component_missing:
                 entry_plan["action"] = f"fail: missing Scylla Components option '{components}'"
@@ -296,14 +526,26 @@ def build_plan(scan_results, repo_config, config, missing_components):
             sub_jira_key = sub_entry["jira_key"]
 
             if sub_jira_key:
-                plan.append({
-                    "action": "skip",
+                if mgr and not skip_update_check:
+                    action, reason = _check_update_needed(sub.get("body", ""), sub_jira_key, mgr)
+                else:
+                    action, reason = "skip", "Already migrated"
+                sub_plan_entry = {
+                    "action": action,
                     "github_ref": sub["url"],
                     "github_title": sub["title"],
                     "jira_key": sub_jira_key,
-                    "reason": "Already migrated",
-                })
+                    "reason": reason,
+                }
+                if action == "update":
+                    sub_plan_entry["github_body"] = sub.get("body", "")
+                plan.append(sub_plan_entry)
             else:
+                effective_config = repo_config_for_url(sub["url"], sub["title"], config)
+                if not effective_config:
+                    continue
+                prefix, components, patterns, cleaned = resolve_rule(sub["title"], effective_config, config)
+                component_missing = components in missing_components
                 issue_type_name = sub.get("issue_type") or ""
                 jira_type = type_mapping.get(issue_type_name, default_worktype)
 
@@ -311,10 +553,11 @@ def build_plan(scan_results, repo_config, config, missing_components):
                     "action": "create",
                     "github_ref": sub["url"],
                     "github_title": sub["title"],
+                    "github_body": sub.get("body", ""),
                     "jira_issue_type": jira_type,
                     "jira_project": project,
                     "scylla_components": components,
-                    "summary": "{} {}".format(prefix, re.sub(r'^\[.*?\]\s*', '', sub['title'])),
+                    "summary": "{} {}".format(prefix, strip_title(cleaned, patterns)),
                 }
                 if component_missing:
                     entry_plan["action"] = f"fail: missing Scylla Components option '{components}'"
@@ -395,6 +638,12 @@ def execute_plan(plan, config, mgr):
 
         _create_jira_issue(entry, jira, config, github_token, created_keys)
 
+    # Fourth pass: update issues with changed descriptions
+    for entry in plan:
+        if entry["action"] != "update":
+            continue
+        _update_jira_issue(entry, jira, config)
+
 
 def _execute_field_options(plan, mgr):
     """Execute create_field_option plan entries."""
@@ -442,11 +691,14 @@ def _create_jira_issue(entry, jira, config, github_token, created_keys):
     components = entry.get("scylla_components", "")
     github_ref = entry["github_ref"]
 
+    github_body = entry.get("github_body", "")
+    description = build_jira_description(github_body, github_ref)
+
     fields = {
         "project": {"key": project},
         "summary": summary,
         "issuetype": {"name": issue_type},
-        "description": f"Migrated from GitHub: {github_ref}",
+        "description": description,
     }
 
     if components:
@@ -529,6 +781,10 @@ def main():
         "--create-components", action="store_true",
         help="Include create_field_option steps in the plan for missing Scylla Components",
     )
+    parser.add_argument(
+        "--skip-update-check", action="store_true",
+        help="Skip checking Jira for description updates on already-migrated issues",
+    )
     args = parser.parse_args()
 
     config = load_and_validate_config(args.config)
@@ -570,13 +826,14 @@ def main():
     full_plan = list(field_plan)
     for repo_config in repos:
         scan_results = scan_repo(repo_config, github_token)
-        plan = build_plan(scan_results, repo_config, config, issue_missing)
+        plan = build_plan(scan_results, repo_config, config, issue_missing,
+                          mgr=mgr, skip_update_check=args.skip_update_check)
         full_plan.extend(plan)
 
     if args.execute_all or args.execute:
         if issue_missing:
             # Print plan with failures to stdout, errors to stderr, then abort
-            print(yaml.dump(full_plan, default_flow_style=False, sort_keys=False))
+            print(yaml.dump(_plan_for_display(full_plan), default_flow_style=False, sort_keys=False))
             report_missing_components(sorted(issue_missing))
             sys.exit(1)
 
@@ -591,7 +848,7 @@ def main():
             execute_plan(full_plan, config, mgr)
     else:
         # Default: print YAML plan to stdout
-        print(yaml.dump(full_plan, default_flow_style=False, sort_keys=False))
+        print(yaml.dump(_plan_for_display(full_plan), default_flow_style=False, sort_keys=False))
         if issue_missing:
             report_missing_components(sorted(issue_missing))
 

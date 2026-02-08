@@ -2,12 +2,11 @@ jira:
   url: "https://scylladb.atlassian.net"
 
 jira_project: "DRIVER"
+github_title_strip:
+  - '^\[.*?\]\s*'
 default_worktype: "Task"
 type_mapping:
-  Bug: "Bug"
-  Task: "Task"
   Epic: "Epic"
-  Feature: "Story"
 
 repos:
   # Drivers
@@ -15,6 +14,16 @@ repos:
     jira_prefix: "python-driver:"
     scylla_components: "Driver - python-driver"
   - github: "scylladb/java-driver"
+    github_title_strip: '^[43]\\.[xX]:\s*'
+    rules:
+      - match:
+          issue_title: "^3\\.[xX]:"
+        jira_prefix: "java-driver-3.x:"
+        scylla_components: "Driver - java-driver-3.x"
+      - match:
+          issue_title: "^4\\.[xX]:"
+        jira_prefix: "java-driver-4.x:"
+        scylla_components: "Driver - java-driver-4.x"
     jira_prefix: "java-driver:"
     scylla_components: "Driver - java-driver-4.x"
   - github: "scylladb/nodejs-rs-driver"
@@ -74,5 +83,5 @@ repos:
     scylla_components: "Connector - spark-connector"
   - github: "scylladb/scylla-drivers"
     jira_prefix: "Drivers:"
-    scylla_components: "Driver"
+    scylla_components: "Drivers"
 

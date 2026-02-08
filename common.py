@@ -1,10 +1,40 @@
 """Shared Jira utilities: config loading and JiraManager API client."""
 
+import hashlib
 import re
 import sys
 
 import requests
 import yaml
+
+
+def compute_body_hash(body):
+    """Compute SHA-256 hash of a GitHub issue body string."""
+    if body is None:
+        body = ""
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def extract_hash_from_adf(description):
+    """Walk ADF paragraph nodes to find 'Hash: <64hex>' pattern.
+
+    The description is expected to be an Atlassian Document Format (ADF)
+    structure returned by the Jira v3 API.  Returns the hash string or None.
+    """
+    if not description or not isinstance(description, dict):
+        return None
+    for node in description.get("content", []):
+        if node.get("type") != "paragraph":
+            continue
+        text_parts = []
+        for child in node.get("content", []):
+            if child.get("type") == "text":
+                text_parts.append(child.get("text", ""))
+        line = "".join(text_parts)
+        m = re.match(r"^Hash:\s+([0-9a-f]{64})$", line.strip())
+        if m:
+            return m.group(1)
+    return None
 
 
 def load_config(path):
@@ -40,6 +70,8 @@ class JiraManager:
         if not resp.ok:
             print(f"Error {resp.status_code}: {resp.text}", file=sys.stderr)
         resp.raise_for_status()
+        if resp.status_code == 204 or not resp.content:
+            return None
         return resp.json()
 
     def _delete(self, path):
@@ -130,6 +162,10 @@ class JiraManager:
     def get_issue(self, key):
         """Get a single issue by key."""
         return self._get(f"/rest/api/3/issue/{key}")
+
+    def update_issue(self, key, fields):
+        """Update fields on an existing Jira issue."""
+        return self._put(f"/rest/api/3/issue/{key}", {"fields": fields})
 
     def delete_issue(self, key):
         """Delete a single issue by key."""
